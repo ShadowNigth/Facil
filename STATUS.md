@@ -67,6 +67,18 @@ per-bone projection:
 | longest triangle edge, all 21 clips × all frames | 9.0 = the bind value → **no stretching** |
 | gun size across every clip | 3.7–11.0 units in all frames (bind 5.8 × 1.5 × 10.5) |
 
+### `v_ak47` — same treatment, same result
+
+| check | result |
+|---|---|
+| bones / verts / tris | 70 / 1 916 / 4 345 |
+| sequences | 20 |
+| textures / size | 3 / 1.88 MB, no compiler warnings |
+| longest triangle edge, all 20 clips × all frames | 9.5 = the bind value → no stretching |
+
+The rig is mirrored here too (`v_weapon` scale −0.8128, 70/70 negative
+determinants) and the global reflection handles it with no per-model tuning.
+
 ## Bug fixes found along the way (cont.)
 
 | # | Bug | Fix |
