@@ -373,10 +373,15 @@ def collect_primitives(g, rig):
         if 'mesh' in nd:
             owner.setdefault(nd['mesh'], ni)
     skin = bool(g.j.get('skins'))
+    joints = list(g.j['skins'][0]['joints']) if skin else []
+    njoints = len(joints)
     prims = []
     for mi, mesh in enumerate(g.j['meshes']):
         M = np.eye(4)
-        if owner.get(mi) is not None:
+        # glTF spec: the transform of a node holding a *skinned* mesh is ignored;
+        # the geometry is already expressed in skin space.  Honouring it here is
+        # what pushed the pistol away from the hands.
+        if owner.get(mi) is not None and not skin:
             M = local_matrix(g.nodes[owner[mi]])
         for pr in mesh['primitives']:
             at = pr['attributes']
@@ -389,14 +394,46 @@ def collect_primitives(g, rig):
             if 'JOINTS_0' in at:
                 JI = g.acc(at['JOINTS_0']).astype(np.int64)
                 Wt = g.acc(at['WEIGHTS_0']).astype(np.float64)
+                # JOINTS_0 holds indices into skin.joints, not node numbers
+                JI = JI.copy()
+                if njoints:
+                    ok = JI < njoints
+                    JI = np.where(ok, np.asarray(joints, np.int64)[np.clip(JI, 0, njoints - 1)],
+                                  -1)
+                    JI[~ok] = -1
+                Wt = np.where(JI >= 0, Wt, 0.0)
             else:
-                JI = np.zeros((len(P), 1), np.int64)
-                Wt = np.ones((len(P), 1))
-            R3 = M[:3, :3]
-            Pw = (R3 @ P.T).T + M[:3, 3]
+                JI = np.full((len(P), 1), -1, np.int64)
+                Wt = np.zeros((len(P), 1))
+            if skin:
+                # linear blend skinning with the *rest* pose: at rest every skin
+                # matrix is ~identity, so this maps skin space -> world.  The
+                # skeleton frames were pre-multiplied by ``scale``, but the inverse
+                # bind matrices were not, so skinning must use the unscaled world
+                # or ``W . IBM`` is no longer the identity.
+                world = getattr(rig, 'world_unscaled', rig.world)
+                Pw = np.zeros_like(P)
+                Nw = np.zeros_like(P) if N is not None else None
+                for k in range(JI.shape[1]):
+                    for j in np.unique(JI[:, k]):
+                        if j < 0:
+                            continue
+                        sel = JI[:, k] == j
+                        node = rig.ix.get(int(j))
+                        Sm = (rig.skin_matrix(node, world=world[node])
+                              if node is not None else np.eye(4))
+                        w = Wt[sel, k:k + 1]
+                        Pw[sel] += w * (P[sel] @ Sm[:3, :3].T + Sm[:3, 3])
+                        if N is not None:
+                            Nw[sel] += w * (N[sel] @ Sm[:3, :3].T)
+                if N is not None:
+                    N = Nw
+            else:
+                R3 = M[:3, :3]
+                Pw = (R3 @ P.T).T + M[:3, 3]
+                Nw = None if N is None else (np.linalg.inv(R3).T @ N.T).T
             if abs(getattr(rig, 'scale', 1.0) - 1.0) > 1e-9:
                 Pw = Pw * rig.scale
-            Nw = None if N is None else (np.linalg.inv(R3).T @ N.T).T
             prims.append(dict(
                 P=Pw, N=Nw, UV=UV, idx=idx.reshape(-1, 3), J=JI, W=Wt,
                 mat=int(pr.get('material', 0)), skinned=skin))
@@ -410,8 +447,10 @@ def weld(prims, rig):
     for pr in prims:
         P = pr['P']
         if pr['skinned']:
+            # JOINTS_0 was resolved to glTF *node* numbers; bone_of_node is keyed by
+            # rig index, so translate back through rig.ix.
             dom = pr['J'][np.arange(len(P)), np.argmax(pr['W'], axis=1)]
-            dom_node = np.array([rig.node_of_joint.get(int(j), 0) for j in dom])
+            dom_node = np.array([rig.ix.get(int(j), 0) if j >= 0 else 0 for j in dom])
         else:
             dom_node = np.zeros(len(P), np.int64)
         vmap = np.empty(len(P), np.int64)
@@ -441,12 +480,12 @@ def weld(prims, rig):
             np.array(tris, np.int64))
 
 
-def decimate(verts, bones, nrm, uvs, tris, target_tris):
+def decimate(verts, bones, nrm, uvs, tris, target_tris, target_verts=None):
     lo = verts.min(axis=0)
     diag = float(np.linalg.norm(verts.max(axis=0) - lo)) or 1.0
-    for k in range(1, 90):
+    for k in range(1, 400):
         step = 0.0035 * (1.09 ** k) * diag
-        if step > 0.4 * diag:
+        if step > 0.6 * diag:
             break
         cells = np.floor((verts - lo) / step).astype(np.int64)
         key, rep, remap = {}, [], np.empty(len(verts), np.int64)
@@ -460,7 +499,9 @@ def decimate(verts, bones, nrm, uvs, tris, target_tris):
         t2 = remap[tris[:, :3]]
         ok = ((t2[:, 0] != t2[:, 1]) & (t2[:, 1] != t2[:, 2]) &
               (t2[:, 0] != t2[:, 2]))
-        if ok.sum() <= target_tris:
+        nverts = len(key)
+        if ok.sum() <= target_tris and (target_verts is None
+                                        or nverts <= target_verts):
             t2 = t2[ok]
             mats = tris[ok][:, 3]
             used = np.unique(t2.reshape(-1))
@@ -666,21 +707,21 @@ class Converter:
             span = max(hi - lo, 1e-6)
             self.scale = self.TARGET_UNITS / span if span < 2.0 else 1.0
         rig.scale = self.scale
-        if abs(self.scale - 1.0) > 1e-9:
-            S = np.diag([self.scale, self.scale, self.scale, 1.0])
-            rig.world = [S @ W for W in rig.world]
+        rig.world_unscaled = list(rig.world)
+        # ``rig.world`` stays in source units: the animation sampler rebuilds it
+        # from the node transforms on every frame, so pre-scaling it only scaled
+        # the bind pose and left the clips 1x too small (and the geometry pass
+        # multiplies by ``scale`` itself, which used to double-apply it).
         prims = collect_primitives(g, rig)
         verts, bone_node, nrm, uvs, tris = weld(prims, rig)
         self.log('  welded %d verts %d tris (source)' % (len(verts), len(tris)))
-        for _ in range(10):
-            nv = len(np.unique(tris[:, :3].reshape(-1))) if len(tris) else 0
-            if nv <= SAFE_VERTS and len(tris) <= SAFE_TRIS:
-                break
+        # One decimation pass aimed straight at the real limit.  Looping with a
+        # 0.8x target over-shrank the mesh (each pass re-grids the *already*
+        # reduced set), which once collapsed a pistol to 144 vertices.
+        nv = len(np.unique(tris[:, :3].reshape(-1)))
+        if nv > SAFE_VERTS or len(tris) > SAFE_TRIS:
             verts, bone_node, nrm, uvs, tris = decimate(
-                verts, bone_node, nrm, uvs, tris,
-                min(int(SAFE_TRIS * 0.9), max(200, int(len(tris) * 0.8))))
-            if len(tris) < 64:
-                break
+                verts, bone_node, nrm, uvs, tris, SAFE_TRIS, SAFE_VERTS)
         used = np.unique(tris[:, :3].reshape(-1))
         inv = {int(u): i for i, u in enumerate(used)}
         tris[:, :3] = np.vectorize(inv.get)(tris[:, :3])
@@ -760,31 +801,56 @@ class Converter:
                  (len(order), names[0], ', '.join(names[1:2])))
 
         # ---------------- bind pose (GoldSrc space) ---------------------
-        # True bind world matrices in GoldSrc space (may be improper: these rigs
-        # carry mirrored nodes).  The frames stored in the model must be proper
-        # rotations, so every bone gets F_b = project(W_b) and bone-local vertex
-        # data is pre-multiplied by F_b^-1 * W_b, which keeps the rest pose exact.
-        self.W0 = []
+        # These source rigs are *globally* mirrored: every joint of the weapon
+        # viewmodels carries a negative-determinant matrix.  GoldSrc bone frames
+        # must be proper rotations, and reflecting individual subtrees is exactly
+        # what tore the mesh apart.  The mirror is uniform across the skeleton,
+        # so the motion of a bone relative to its own rest pose is proper even
+        # though the absolute matrix is not:
+        #
+        #     G_b(f) = W_b(f) . W0_b^-1 . F_b          (det G_b = +1)
+        #
+        # with F_b the rest frame stored in the model and W_b the true world
+        # matrix of the source (both in GoldSrc axes).  At the rest pose
+        # G_b = F_b for every bone, so the engine reproduces the source mesh
+        # exactly and no geometry is mirrored.
+        # Option 1: the whole rig is mirrored, so mirror the whole model *once*
+        # instead of projecting each bone (which reflected individual subtrees and
+        # tore the mesh apart).  After one global reflection every bone matrix is a
+        # proper rotation, the mesh is a coherent mirror image of the source, and
+        # nothing has to be projected anywhere.
+        gold_w = []
         for n in order:
             W = np.eye(4)
             W[:3, :3] = gold_rot(rig.world[n][:3, :3])
-            W[:3, 3] = to_gold(rig.world[n][:3, 3])
-            self.W0.append(W)
+            W[:3, 3] = to_gold(rig.world[n][:3, 3]) * self.scale
+            gold_w.append(W)
+        dets = [float(np.linalg.det(W[:3, :3])) for W in gold_w]
+        if sum(1 for d in dets if d < 0) > len(dets) / 2:
+            self.mirror = np.diag([-1.0, 1.0, 1.0, 1.0])
+            self.log('  rig is mirrored -> applied one global reflection')
+        else:
+            self.mirror = np.eye(4)
+        self.W0 = [self.mirror @ W for W in gold_w]
         self.F = []
-        for i, n in enumerate(order):
-            F = np.eye(4)
-            F[:3, :3] = project_rotation(self.W0[i][:3, :3])
-            F[:3, 3] = self.W0[i][:3, 3]
+        for i in range(len(order)):
+            F = self.W0[i].copy()
+            # safety net: only project if a bone is still improper after the
+            # global reflection (mixed-handedness rigs)
+            if np.linalg.det(F[:3, :3]) < 0:
+                F[:3, :3] = project_rotation(F[:3, :3])
             self.F.append(F)
+        # cached pieces used per frame
+        self.W0rot = [W[:3, :3].copy() for W in self.W0]
+        self.W0invF = [np.linalg.inv(self.W0[i]) @ self.F[i]
+                       for i in range(len(order))]
         self.bind_local = []      # stored frames: proper rotation + local offset
         for i in range(len(order)):
             p = qc_parent[i]
             L = self.F[i] if p < 0 else np.linalg.inv(self.F[p]) @ self.F[i]
             self.bind_local.append((L[:3, 3], mat_to_angles(L[:3, :3])))
         # Vertices are written to the SMD in world space; studiomdl converts them
-        # into bone space with the rest pose (the skeleton in the reference SMD).
-        # F_b (the proper part of W0_b) is used for the stored rest rotation so that
-        # mirrored nodes -- common in these CS ports -- still get a valid frame.
+        # into bone space itself, using the rest pose in the reference skeleton.
         self.write_reference(verts, bone_node, nrm, uvs, tris)
         seqs = self.write_animations()
         self.write_qc(verts, seqs)
@@ -800,6 +866,8 @@ class Converter:
         # build_reference) moves every vertex into its bone's space itself, using the
         # rest pose written to the skeleton block.  Pre-transforming here would
         # apply that twice.
+        M3 = self.mirror[:3, :3]
+        V, N = (M3 @ V.T).T, (M3 @ N.T).T
         Vb, Nb = V.copy(), N.copy()
         self.used_mats = sorted(set(int(m) for m in tris[:, 3]))
         self.tex = {mi: write_texture(self.g, mi, self.smd_dir)
@@ -867,11 +935,26 @@ class Converter:
                 world = poses_to_world(rig, fr)
                 # engine chain A_b(f) = project(W_b(f)): proper, equals the true
                 # world matrix for normal bones, keeps mirrored subtrees rigid
+                # G_b(f) = W_b(f) . W0_b^-1 . F_b  -- proper for every bone,
+                # and equal to F_b at the rest pose.
+                # full mirrored world matrix -- the same construction used for
+                # the bind frames, so A(rest) is bit-identical to F and the
+                # engine's rest + delta lands exactly on the bind pose.  (An
+                # offset-local formula here left the translation at zero and
+                # every clip exploded.)
                 A = []
                 for i, nd in enumerate(self.order):
                     M = np.eye(4)
-                    M[:3, :3] = project_rotation(gold_rot(world[nd][:3, :3]))
-                    M[:3, 3] = to_gold(world[nd][:3, 3]) * self.scale
+                    M[:3, :3] = self.mirror[:3, :3] @ gold_rot(world[nd][:3, :3])
+                    M[:3, 3] = self.mirror[:3, :3] @ (to_gold(world[nd][:3, 3])
+                                                      * self.scale)
+                    # the global reflection makes every *mirrored* bone proper,
+                    # but a bone that was already proper in the source (only the
+                    # Armature root here) comes out improper.  Its local frame then
+                    # poisons every descendant's delta, so project it back exactly
+                    # like the bind frames do.
+                    if np.linalg.det(M[:3, :3]) < 0:
+                        M[:3, :3] = project_rotation(M[:3, :3])
                     A.append(M)
                 row = []
                 prev = out[-1] if out else None
@@ -882,14 +965,18 @@ class Converter:
                     # difference against the rest frame as the engine's delta, and
                     # the engine adds them component-wise, so every frame must stay
                     # on the same Euler branch as the previous one
+                    # rows hold *absolute* angles, so the continuity hint is the
+                    # previous frame's absolute triple (adding bind_local here
+                    # shifted the hint by a whole branch and produced +-pi jumps)
                     hint = (self.bind_local[i][1] if prev is None
-                            else self.bind_local[i][1] + prev[i][1])
-                    # The engine shows ``rest + delta`` for both translation and
-                    # rotation, so the SMD frame carries the difference between the
-                    # absolute local transform and the stored rest frame.
-                    pos = L[:3, 3] - self.bind_local[i][0]
-                    row.append((pos, mat_to_angles(L[:3, :3], hint)
-                                - self.bind_local[i][1]))
+                            else prev[i][1])
+                    # SMD animation frames hold the *absolute* local transform.
+                    # studiomdl subtracts the rest frame itself
+                    # (``panim.pos - bonetable.pos`` in find scales), and the engine
+                    # then shows ``value + delta``; subtracting bind_local here as
+                    # well applied the rest offset twice and blew the pose up.
+                    row.append((L[:3, 3].copy(),
+                                mat_to_angles(L[:3, :3], hint)))
                 out.append(row)
             for f in range(1, nframes):
                 for i in range(n):
